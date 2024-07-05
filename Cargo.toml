@@ -1,0 +1,11 @@
+[package]
+name = "iouring_vs_tokio"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rand = "*"
+libc = "*"
+tokio = { version = "1", features = ["full"] }
+eyre = "0.6.12"
+io-uring = { git = "https://github.com/Berrysoft/io-uring.git", rev = "fc3897f0e847051a5e427a186f31a3e4ee51db4b" }
