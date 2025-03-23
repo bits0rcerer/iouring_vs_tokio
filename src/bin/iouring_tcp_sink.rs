@@ -1,29 +1,52 @@
 use std::{
     env::args,
     mem::MaybeUninit,
-    net::{TcpListener, TcpStream},
+    net::{SocketAddr, TcpStream},
     os::fd::{AsRawFd, FromRawFd, IntoRawFd},
     ptr::slice_from_raw_parts_mut,
+    str::FromStr,
     time::Duration,
 };
 
 use io_uring::{cqueue, opcode, squeue, types::Fd};
+use socket2::{Domain, Type};
 
 const ACCEPT: u64 = u64::MAX;
-const POLL: u64 = u64::MAX - 1;
 
 fn main() -> eyre::Result<()> {
     println!("iouring tcp sink");
 
     let threads = args().nth(1).unwrap_or("4".to_string());
-    let threads = usize::from_str_radix(&threads, 10)?;
+    let threads = threads.parse()?;
 
-    let socket = TcpListener::bind("[::0]:1234")?;
-    let socket_fd = socket.as_raw_fd();
+    let mut rings: Vec<io_uring::IoUring> = vec![];
+    let mut handles = vec![];
 
-    let handles = (0..threads)
-        .map(|_| std::thread::spawn(move || ring_main(socket_fd)))
-        .collect::<Vec<_>>();
+    for _ in 0..threads {
+        let mut ring_builder = io_uring::IoUring::<squeue::Entry, cqueue::Entry>::builder();
+        ring_builder
+            .setup_r_disabled()
+            .setup_single_issuer()
+            .setup_coop_taskrun()
+            .setup_taskrun_flag()
+            .setup_defer_taskrun();
+
+        if let Some(ring) = rings.first() {
+            ring_builder.setup_attach_wq(ring.as_raw_fd());
+        }
+
+        rings.push(ring_builder.build(1024)?);
+    }
+    for ring in rings {
+        let socket = socket2::Socket::new(Domain::IPV6, Type::STREAM, None)?;
+        socket.set_reuse_port(true)?;
+
+        let addr = SocketAddr::from_str("[::0]:1234")?.into();
+        socket.bind(&addr)?;
+        socket.listen(128)?;
+
+        handles.push(std::thread::spawn(move || ring_main(socket, ring)));
+    }
 
     for h in handles {
         h.join().expect("thread join")?;
@@ -32,19 +55,16 @@ fn main() -> eyre::Result<()> {
     Ok(())
 }
 
-fn ring_main(listen_fd: i32) -> eyre::Result<()> {
-    // setup io uring
-    let mut ring: io_uring::IoUring<squeue::Entry, cqueue::Entry> = io_uring::IoUring::builder()
-        .setup_defer_taskrun()
-        .setup_coop_taskrun()
-        .setup_single_issuer()
-        .build(128)?;
-
+fn ring_main(listen_socket: socket2::Socket, mut ring: io_uring::IoUring) -> eyre::Result<()> {
     let (submitter, mut sq, mut cq) = ring.split();
+    submitter.register_enable_rings()?;
+    let mut workers = [0, 0];
+    submitter.register_iowq_max_workers(&mut workers)?;
+    println!("workers: {workers:?}");
 
     // setup buffer ring for registered buffers
     let mut buf_ring = submitter.setup_buf_ring(256, 42)?;
-    let buf_len = 1 * 1024 * 1024;
+    let buf_len = 1024 * 1024;
     let bufs = unsafe {
         let bufs = match libc::mmap(
             std::ptr::null_mut(),
@@ -58,7 +78,11 @@ fn ring_main(listen_fd: i32) -> eyre::Result<()> {
                 panic!("unable to map buffers: {}", std::io::Error::last_os_error())
             }
             addr => {
-                libc::madvise(addr, buf_len * buf_ring.capacity(), libc::MADV_SEQUENTIAL);
+                libc::madvise(
+                    addr,
+                    buf_len * buf_ring.capacity(),
+                    libc::MADV_SEQUENTIAL | libc::MADV_HUGEPAGE,
+                );
                 std::ptr::NonNull::new_unchecked(addr).cast::<MaybeUninit<u8>>()
             }
         };
@@ -74,20 +98,7 @@ fn ring_main(listen_fd: i32) -> eyre::Result<()> {
         bufs
     };
 
-    // Using poll instead of multishot accept because this distributes new connection
-    // accross all threads.
-    //
-    // Using multishot accept on all threads on a single socket did only create cqes
-    // on a single thread.
-    //
-    // (at least on my machine :])
-    unsafe {
-        let poll = opcode::PollAdd::new(Fd(listen_fd), libc::POLLIN as u32)
-            .multi(true)
-            .build()
-            .user_data(POLL);
-        sq.push(&poll).expect("sq is empty");
-    }
+    accept(&listen_socket, &mut sq);
 
     loop {
         sq.sync();
@@ -108,33 +119,6 @@ fn ring_main(listen_fd: i32) -> eyre::Result<()> {
         for cqe in &mut cq {
             match cqe.user_data() {
                 0 => continue,
-                POLL => match cqe.result() {
-                    0 => continue,
-                    e if e < 0 => {
-                        panic!("unable to poll: {}", std::io::Error::from_raw_os_error(-e))
-                    }
-                    _ => unsafe {
-                        let mut addr = std::mem::zeroed();
-                        let mut addr_len = std::mem::zeroed();
-                        let accept = opcode::Accept::new(
-                            Fd(listen_fd),
-                            std::ptr::addr_of_mut!(addr),
-                            std::ptr::addr_of_mut!(addr_len),
-                        )
-                        .build()
-                        .user_data(ACCEPT);
-
-                        sq.push(&accept).expect("sq not full");
-
-                        if !cqueue::more(cqe.flags()) && cqe.result() > 0 {
-                            let poll = opcode::PollAdd::new(Fd(listen_fd), libc::POLLIN as u32)
-                                .multi(true)
-                                .build()
-                                .user_data(POLL);
-                            sq.push(&poll).expect("sq is empty");
-                        }
-                    },
-                },
                 ACCEPT => {
                     let fd = match cqe.result() {
                         e if e < 0 => panic!(
@@ -158,6 +142,10 @@ fn ring_main(listen_fd: i32) -> eyre::Result<()> {
                     unsafe {
                         sq.push(&recv).expect("sq not full");
                     }
+
+                    if !cqueue::more(cqe.flags()) {
+                        accept(&listen_socket, &mut sq);
+                    }
                 }
                 stream_fd => {
                     match cqe.result() {
@@ -169,7 +157,7 @@ fn ring_main(listen_fd: i32) -> eyre::Result<()> {
                             "unable to read from connection: {}",
                             std::io::Error::from_raw_os_error(-e)
                         ),
-                        n => {
+                        _n => {
                             //println!("recv {n} bytes");
                             // magic
                         }
@@ -206,4 +194,13 @@ fn ring_main(listen_fd: i32) -> eyre::Result<()> {
     // }
 
     // Ok(())
+}
+
+fn accept(listen_socket: &socket2::Socket, sq: &mut squeue::SubmissionQueue) {
+    unsafe {
+        let accept = opcode::AcceptMulti::new(Fd(listen_socket.as_raw_fd()))
+            .build()
+            .user_data(ACCEPT);
+        sq.push(&accept).expect("sq is empty");
+    }
 }
