@@ -8,5 +8,5 @@ rand = "*"
 libc = "*"
 tokio = { version = "1", features = ["full"] }
 eyre = "0.6.12"
-io-uring = { git = "https://github.com/Berrysoft/io-uring.git", rev = "fc3897f0e847051a5e427a186f31a3e4ee51db4b" }
+io-uring = { git = "https://github.com/bits0rcerer/io-uring.git", branch = "buf-ring" }
 socket2 = "0.5.8"
